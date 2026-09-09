@@ -17,10 +17,8 @@ SLEEPER_PLAYERS_URL = "https://api.sleeper.app/v1/players/nfl"
 SLEEPER_DRAFT_PICKS_URL = "https://api.sleeper.app/v1/draft/{draft_id}/picks"
 POSITIONS = ("QB", "RB", "WR", "TE")
 
-LEAGUE_SIZE = 12
 
-
-def generate_user_picks(draft_position: int, league_size: int = LEAGUE_SIZE, rounds: int = 25) -> list[int]:
+def generate_user_picks(draft_position: int, league_size: int = 10, rounds: int = 25) -> list[int]:
     """Generates the user's specific pick numbers across a snake draft."""
     return [
         (r - 1) * league_size + draft_position if r % 2 != 0 else r * league_size - draft_position + 1
@@ -42,14 +40,8 @@ def extract_draft_id(input_str: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", input_str)
 
 
-def get_draft_horizon(current_pick: int, user_picks: list[int]) -> tuple[int, int]:
-    """
-    Returns (upcoming_user_pick, horizon_user_pick).
-    Example for Pick 10 slot:
-      - At Pick 3: Upcoming = 10, Horizon = 15
-      - At Pick 10: Upcoming = 10, Horizon = 15
-      - At Pick 12: Upcoming = 15, Horizon = 34
-    """
+def get_draft_horizon(current_pick: int, user_picks: list[int], league_size: int = 10) -> tuple[int, int]:
+    """Returns (upcoming_user_pick, horizon_user_pick)."""
     upcoming_idx = 0
     for idx, p in enumerate(user_picks):
         if p >= current_pick:
@@ -61,17 +53,17 @@ def get_draft_horizon(current_pick: int, user_picks: list[int]) -> tuple[int, in
     if upcoming_idx + 1 < len(user_picks):
         horizon_pick = user_picks[upcoming_idx + 1]
     else:
-        horizon_pick = upcoming_pick + 15
+        horizon_pick = upcoming_pick + league_size
 
     return upcoming_pick, horizon_pick
 
 
-def adp_to_pick_format(adp: float | int | None) -> str:
-    """Converts ADP number to Round.Pick format for a 12-team league (e.g., 37 -> 4.1)."""
+def adp_to_pick_format(adp: float | int | None, league_size: int = 10) -> str:
+    """Converts ADP number to Round.Pick format based on league size (e.g. pick 31 in 10-team -> 4.1)."""
     if pd.isna(adp) or adp is None or adp <= 0:
         return "-"
-    round_num = int((adp - 1) // LEAGUE_SIZE) + 1
-    pick_num = int((adp - 1) % LEAGUE_SIZE) + 1
+    round_num = int((adp - 1) // league_size) + 1
+    pick_num = int((adp - 1) % league_size) + 1
     return f"{round_num}.{pick_num}"
 
 
@@ -99,10 +91,13 @@ def choose_column(columns: list[str], candidates: tuple[str, ...]) -> str | None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_nffc(days_back: int = 7) -> pd.DataFrame:
+def fetch_nffc(days_back: int = 7, nffc_num_teams: str = "10") -> pd.DataFrame:
     today = datetime.now()
     from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to_date = today.strftime("%Y-%m-%d")
+
+    # Map 'All' option to '0' for NFFC payload
+    payload_num_teams = "0" if nffc_num_teams.lower() == "all" else str(nffc_num_teams)
 
     response = requests.post(
         NFFC_ADP_DATA_URL,
@@ -110,7 +105,7 @@ def fetch_nffc(days_back: int = 7) -> pd.DataFrame:
             "team_id": "0",
             "from_date": from_date,
             "to_date": to_date,
-            "num_teams": "12",
+            "num_teams": payload_num_teams,
             "draft_type": "0",
             "sport": "football",
             "position": "",
@@ -123,12 +118,12 @@ def fetch_nffc(days_back: int = 7) -> pd.DataFrame:
 
     if "No ADP Information Available" in response.text:
         raise ValueError(
-            f"No NFFC 12-team drafts were completed between {from_date} and {to_date}. "
+            f"No NFFC ({nffc_num_teams}-team) drafts were completed between {from_date} and {to_date}. "
             "Please widen the 'NFFC ADP Window' slider in the sidebar."
         )
 
     table_html = (
-        """<table><thead><tr><th>Rk</th><th>Player</th><th>Team</th><th>Position(s)</th><th>ADP / AAV</th></tr></thead><tbody>"""
+        """<table><thead><tr><th>Rk</th><th>Player</th><th>Team</th><th>Position(s)</th><th>ADP</th></tr></thead><tbody>"""
         + response.text
         + "</tbody></table>"
     )
@@ -138,6 +133,7 @@ def fetch_nffc(days_back: int = 7) -> pd.DataFrame:
         table.columns = [str(c).strip() for c in table.columns]
         player_col = choose_column(list(table.columns), ("player", "playername", "name"))
         adp_col = choose_column(list(table.columns), ("adp", "averagepick", "avgpick"))
+
         if player_col and adp_col:
             position_col = choose_column(list(table.columns), ("position", "pos"))
             player_values = table[player_col].astype(str)
@@ -218,7 +214,7 @@ def fetch_sleeper_draft_picks(draft_id: str) -> list[dict]:
 
 
 def build_board(
-    nffc: pd.DataFrame, sleeper: pd.DataFrame, current_pick: int, user_picks: list[int]
+    nffc: pd.DataFrame, sleeper: pd.DataFrame, current_pick: int, user_picks: list[int], league_size: int = 10
 ) -> tuple[pd.DataFrame, int, int]:
     nffc = nffc.copy()
     sleeper = sleeper.copy()
@@ -230,10 +226,10 @@ def build_board(
     board = nffc.merge(sleeper[["key", "Sleeper ADP"]], on="key", how="inner")
     board["Value"] = (board["Sleeper ADP"] - board["NFFC ADP"]).round(1)
 
-    board["NFFC Pick"] = board["NFFC ADP"].map(adp_to_pick_format)
-    board["Sleeper Pick"] = board["Sleeper ADP"].map(adp_to_pick_format)
+    board["NFFC Pick"] = board["NFFC ADP"].map(lambda val: adp_to_pick_format(val, league_size))
+    board["Sleeper Pick"] = board["Sleeper ADP"].map(lambda val: adp_to_pick_format(val, league_size))
 
-    upcoming_pick, target_horizon_pick = get_draft_horizon(current_pick, user_picks)
+    upcoming_pick, target_horizon_pick = get_draft_horizon(current_pick, user_picks, league_size)
 
     def assign_risk_status(row):
         nffc_adp = row["NFFC ADP"]
@@ -282,12 +278,25 @@ if "drafted" not in st.session_state:
 with st.sidebar:
     st.header("Draft Controls")
 
-    # Select draft slot (1 to LEAGUE_SIZE)
+    league_size = st.select_slider(
+        "League Size",
+        options=[10, 12],
+        value=10,
+        help="Toggle between 10-team or 12-team fantasy league sizes."
+    )
+
+    nffc_num_teams = st.selectbox(
+        "NFFC Format / Payload",
+        options=["10", "12", "All"],
+        index=0,
+        help="Select team format parameter sent in the NFFC HTTP request payload."
+    )
+
     draft_position = st.selectbox(
         "Your Draft Position / Slot",
-        options=list(range(1, LEAGUE_SIZE + 1)),
-        index=9,  # Default to Pick 10 (0-indexed 9)
-        help="Select your draft slot in the 12-team order."
+        options=list(range(1, league_size + 1)),
+        index=min(9, league_size - 1),
+        help=f"Select your draft slot in the {league_size}-team order."
     )
 
     raw_draft_input = st.text_input(
@@ -321,10 +330,10 @@ with st.sidebar:
         st.rerun()
 
 # Dynamic Title
-st.title(f"🏈 Pick {draft_position} Turn Strategy Board (12-Team)")
+st.title(f"🏈 Pick {draft_position} Turn Strategy Board ({league_size}-Team)")
 
-# Compute user picks based on chosen slot
-user_picks = generate_user_picks(int(draft_position))
+# Compute user picks based on chosen slot & league size
+user_picks = generate_user_picks(int(draft_position), league_size=league_size)
 
 # Extract draft ID from raw string input or URL
 draft_id = extract_draft_id(raw_draft_input)
@@ -351,11 +360,14 @@ else:
 
 try:
     with st.spinner("Fetching live ADP sources…"):
+        nffc_df = fetch_nffc(days_back=int(nffc_days_back), nffc_num_teams=nffc_num_teams)
+        sleeper_df = fetch_sleeper(int(season))
         board, upcoming_pick, next_target_pick = build_board(
-            fetch_nffc(days_back=int(nffc_days_back)),
-            fetch_sleeper(int(season)),
+            nffc_df,
+            sleeper_df,
             int(current_pick),
-            user_picks
+            user_picks,
+            league_size=league_size
         )
 
     csv = board.to_csv(index=False).encode("utf-8")
@@ -364,11 +376,11 @@ except Exception as exc:
     st.error(f"Live data could not be loaded: {exc}")
     st.stop()
 
-# Info Banner showing active draft pick, upcoming selection, and target survival horizon
+# Info Banner
 st.info(
     f"📍 **Active Pick:** #{current_pick} | "
-    f"🎯 **Upcoming Pick:** #{upcoming_pick} ({adp_to_pick_format(upcoming_pick)}) | "
-    f"🔭 **Target Horizon:** Evaluating survival through Pick **#{next_target_pick}** ({adp_to_pick_format(next_target_pick)})"
+    f"🎯 **Upcoming Pick:** #{upcoming_pick} ({adp_to_pick_format(upcoming_pick, league_size)}) | "
+    f"🔭 **Target Horizon:** Pick **#{next_target_pick}** ({adp_to_pick_format(next_target_pick, league_size)})"
 )
 
 filtered = board.copy()
